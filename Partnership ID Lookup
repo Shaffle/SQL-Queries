@@ -1,0 +1,50 @@
+-- =====================================================================
+-- DRIVE Account Partnership ID Lookup by Business ID
+-- Purpose: Returns the Partnership ID (Drive Account) for given Business IDs
+-- Note: Business-level Partnership ID takes priority over Store-level.
+--       Filtered to ONLY include active partnerships (End Time is NULL).
+-- =====================================================================
+
+WITH target_businesses AS (
+    SELECT TRIM(value)::INT AS business_id
+    FROM TABLE(SPLIT_TO_TABLE( --[[Add Business IDs]]--
+    '13797917, 17594003',
+        ','
+    ))
+),
+
+-- Pre-filter stores to ONLY the businesses we care about for maximum speed
+filtered_stores AS (
+    SELECT business_id, store_id, drive_external_store_id, drive_account_id
+    FROM edw.merchant.dimension_store 
+    WHERE business_id IN (SELECT business_id FROM target_businesses)
+)
+
+SELECT
+    b.business_id::TEXT             AS "Business ID",
+    si.DRIVE_EXTERNAL_STORE_ID      AS "Store Number",
+    si.STORE_ID::TEXT               AS "Store ID",
+    b.business_name                 AS "Business Name",
+    COALESCE(map.id::TEXT, b.drive_account_id::TEXT, si.drive_account_id::TEXT) AS "Partnership ID",
+    map.end_time                    AS "End Time" 
+    
+FROM edw.merchant.dimension_business b
+
+-- Force the query to only look at our specific targets immediately
+INNER JOIN target_businesses tb 
+    ON b.business_id = tb.business_id
+    
+LEFT JOIN filtered_stores si 
+    ON b.business_id = si.business_id
+    
+LEFT JOIN MERCHANT_FINANCIAL_SERVICE_PROD.public.mx_affiliate_program map 
+    ON (LOWER(map.reference_entity_type) = 'store' AND map.reference_entity_id = si.store_id::TEXT)
+    OR (LOWER(map.reference_entity_type) = 'business' AND map.reference_entity_id = b.business_id::TEXT)
+
+-- Filter out inactive partnerships
+WHERE map.end_time IS NULL 
+
+-- Natively pick the top ranked record without needing a wrapper CTE
+QUALIFY ROW_NUMBER() OVER (PARTITION BY b.business_id ORDER BY map.start_time DESC NULLS LAST, si.store_id) = 1
+
+ORDER BY b.business_id::INT ASC;
