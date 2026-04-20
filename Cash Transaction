@@ -1,0 +1,107 @@
+/* =========================================================================================
+   Query Purpose: 
+   Extracts a detailed, row-level transaction and payout history for a specific list of 
+   store locations. It breaks down financial metrics (subtotals, taxes, commissions, fees), 
+   calculates credits/debits, and determines the final delivery/cancellation status of 
+   each order within a specific date range.
+========================================================================================= */
+
+SELECT 
+       -- Date and Time Parsing: Splitting timestamps into distinct Date and Time columns 
+       -- for both UTC and Local timezones to make reporting and aggregation easier.
+       to_time(transaction_created_at_utc)         AS TIMESTAMP_UTC_TIME,
+       to_date(transaction_created_at_utc)         AS TIMESTAMP_UTC_DATE,
+       to_time(transaction_created_at_local)       AS TIMESTAMP_LOCAL_TIME,
+       to_date(transaction_created_at_local)       AS TIMESTAMP_LOCAL_DATE,
+       
+       -- Payout timelines
+       to_varchar(PAYOUT_TIMESTAMP_LOCAL)          AS PAYOUT_TIME,
+       PAYOUT_DATE_LOCAL                           AS PAYOUT_DATE,
+       
+       -- Store and Business Dimensions
+       STORE_ID,
+       BUSINESS_ID,
+       BUSINESS_NAME,
+       STORE_NAME,
+       STORE_ADDRESS,
+       MERCHANT_STORE_ID,
+       
+       -- Transaction Identifiers
+       TRANSACTION_TYPE                            AS TRANSACTION_TYPE,
+       TRANSACTION_ID                              AS TRANSACTION_ID,
+       
+       -- Excel Formatting Trick: Concatenating '="' before and '"' after the ORDER_ID. 
+       -- This prevents spreadsheet tools like Excel from converting long numeric IDs into scientific notation.
+       concat('="', ORDER_ID, '"')                 AS DOORDASH_ORDER_ID,
+       MERCHANT_DELIVERY_ID,
+       EXTERNAL_ID,
+       DESCRIPTION,
+       
+       -- Order Status Logic: Evaluates multiple conditions to determine the final state of the order.
+       CASE
+         WHEN is_consumer_pickup = true THEN 'Picked Up'
+         -- If cancelled, no reason provided, but the transaction still had a positive amount, it's considered paid.
+         WHEN cancelled_at is not null AND (cancellation_reason is null OR cancellation_reason = '') AND transaction_amount > 0 THEN 'Cancelled Paid'
+         -- If cancelled and the above isn't true, append the specific cancellation reason to the status.
+         WHEN cancelled_at is not null THEN ('Cancelled' || ' ' || cancellation_reason)
+         -- Default state if not picked up or cancelled.
+         ELSE 'Delivered' 
+       END AS final_order_status,
+       
+       -- Financial Metrics
+       CURRENCY,
+       subtotal                                    AS SUBTOTAL,
+       subtotal_tax                                AS TAX_SUBTOTAL,
+       COMMISSION,
+       COMMISSION_TAX_AMOUNT,
+       marketing_fees_v2                           AS MARKETING_FEES,
+       
+       -- Debit/Credit Separation: Splits a single transaction_amount column into distinct Credit and Debit columns 
+       -- using absolute values (ABS) to ensure positive numbers in the output.
+       CASE WHEN transaction_amount > 0 THEN ABS(transaction_amount) ELSE 0.00 END AS credit,
+       CASE WHEN transaction_amount < 0 THEN ABS(transaction_amount) ELSE 0.00 END AS debit,
+       
+       -- Alias adjustments for downstream reporting mapping
+       TRANSACTION_ID                              AS DOORDASH_TRANSACTION_ID,
+       Transfer_id                                 AS PAYOUT_ID,
+       DRIVE_CHARGE,
+       TAX_REMITTED_BY_DOORDASH_TO_STATE,
+       SUBTOTAL_FOR_TAX,
+       
+       -- Conditional Logic (IFF): Checks the funding source. If DoorDash funded it, records the amount here; otherwise NULL.
+       IFF(DISCOUNT_FUNDING_SOURCE = 'ENTITY_TYPE_DOORDASH', SUBTOTAL_DISCOUNT, NULL) AS DOORDASH_FUNDED_SUBTOTAL_DISCOUNT_AMOUNT,
+       
+       -- Conditional Logic (IFF): Checks the funding source. If the Merchant funded it, records the amount here; otherwise NULL.
+       IFF(DISCOUNT_FUNDING_SOURCE = 'ENTITY_TYPE_MERCHANT', SUBTOTAL_DISCOUNT, NULL) AS MERCHANT_FUNDED_SUBTOTAL_DISCOUNT_AMOUNT,
+       
+       -- Additional Fees and Adjustments
+       DRIVE_COMMISSION_SUBTOTAL,
+       DRIVE_COMMISSION_TAX,
+       DRIVE_PROMOTION,
+       DASHER_REGULATORY_FEE,
+       AGGREGATOR_FEE,
+       PRE_TIP                                     AS TIP,
+       CASH_ADJUSTMENT,
+       DELIVERY_ID                                 AS "DELIVERY_ID"
+
+FROM edw.merchant.fact_merchant_transactions_details
+
+-- Filtering Criteria
+WHERE Store_Address IN (
+    -- Hardcoded list of target store addresses
+    '9929 Main St., Fairfax, VA 22031',
+    '7756 Gunston Plaza Drive, C Unit 230, Lorton, VA 22079',
+    '9570 Burke Rd B, Burke, VA 22015',
+    '9013 Silverbrook Rd, Fairfax, VA 22039',
+    '6920 Braddock Rd Ste C, Annandale, VA 22003',
+    '326 W Lee Hwy, Warrenton, VA 20186',
+    '6743 Leaberry Way, Haymarket, VA 20169',
+    '6228 Rolling Rd Ste H, Springfield, VA 22152',
+    '13958 Estate Manor Dr, Gainesville, VA 20155'
+)
+-- Date Range: Pulls payouts starting from Feb 13, 2026, up to the current date of the run.
+AND PAYOUT_DATE_LOCAL >= '2026-02-13' 
+AND PAYOUT_DATE_LOCAL <= CURRENT_DATE
+
+-- Sorting: Organizes the final output chronologically by payout date, then groups by store/business, and finally sorts by local transaction time.
+ORDER BY PAYOUT_DATE, store_id, BUSINESS_NAME, transaction_created_at_local;
